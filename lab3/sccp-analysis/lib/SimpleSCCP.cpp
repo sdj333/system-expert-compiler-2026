@@ -85,7 +85,16 @@ SimpleSCCPAnalysis::InstructionVisitor::visitPHINode(const PHINode &I)
 {
   ConstantValue NewValue = ConstantValue::top();
   //******************************** ASSIGNMENT ********************************
-
+  for (unsigned i = 0; i < I.getNumIncomingValues(); ++i)
+  {
+    const BasicBlock *IncomingBB = I.getIncomingBlock(i);
+    CFGEdge Edge = {IncomingBB, I.getParent()};
+    if (ThePass.isExecutableEdge(Edge))
+    {
+      const Value *IncomingVal = I.getIncomingValue(i);
+      NewValue = NewValue.meet(ThePass.getConstantValue(*IncomingVal));
+    }
+  }
   //****************************** ASSIGNMENT END ******************************
   return NewValue;
 }
@@ -278,7 +287,41 @@ void SimpleSCCPAnalysis::analyze(Function &F)
   {
     //* ASSIGNMENT - Algorithm 1
     //******************************* ASSIGNMENT *******************************
+    if (!CFGWorkset.empty())
+    {
+      auto Edge = *CFGWorkset.begin();
+      CFGWorkset.erase(Edge);
 
+      if (ExecutableEdges.count(Edge))
+        continue;
+      ExecutableEdges.insert(Edge);
+
+      const BasicBlock *DestBB = Edge.To;
+      if (isFirstVisit(*DestBB))
+      {
+        for (const Instruction &I : *DestBB)
+        {
+          visit(I);
+        }
+      }
+      else
+      {
+        for (const PHINode &PN : DestBB->phis())
+        {
+          visit(PN);
+        }
+      }
+    }
+    else if (!SSAWorkset.empty())
+    {
+      const Instruction *I = *SSAWorkset.begin();
+      SSAWorkset.erase(I);
+
+      if (isExecutableBlock(*I->getParent()))
+      {
+        visit(*I);
+      }
+    }
     //***************************** ASSIGNMENT END *****************************
   }
 }
@@ -291,11 +334,24 @@ void SimpleSCCPAnalysis::visit(const Instruction &I)
   ConstantValue NewLatticeValue =
       TheVisitor.visit(const_cast<Instruction &>(I));
   // Set default value.
-  ConstantValue OldLatticeValue = ConstantValue::top();
+  ConstantValue OldLatticeValue = getConstantValue(I);
 
   //* ASSIGNMENT - Algorithm 2
   //******************************** ASSIGNMENT ********************************
+  if (I.getType()->isVoidTy())
+    return;
 
+  if (NewLatticeValue != OldLatticeValue)
+  {
+    DataflowFacts[const_cast<Instruction *>(&I)] = NewLatticeValue;
+    for (const User *U : I.users())
+    {
+      if (const Instruction *UserInst = dyn_cast<Instruction>(U))
+      {
+        SSAWorkset.insert(UserInst);
+      }
+    }
+  }
   //****************************** ASSIGNMENT END ******************************
 }
 
