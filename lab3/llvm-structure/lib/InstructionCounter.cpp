@@ -10,12 +10,12 @@ using namespace llvm;
 PreservedAnalyses InstructionCounter::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
   //******************************** ASSIGNMENT ********************************
-
-
-
-
-
-
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      std::string OpcodeName = I.getOpcodeName();
+      InstructionCounter[OpcodeName]++;
+    }
+  }
   //****************************** ASSIGNMENT END ******************************
 
   errs() << "Instruction hit counts\n";
