@@ -12,6 +12,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <vector>
 
 using namespace llvm;
@@ -379,6 +380,167 @@ bool SimpleSCCPTransform::foldConstants(Function &F,
   IRBuilder<> IRB(F.getContext());
 
   //******************************** ASSIGNMENT ********************************
+  auto tryGetConstantInt = [&](const Value *V, int64_t &Out) -> bool {
+    if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+      Out = CI->getSExtValue();
+      return true;
+    }
+    auto It = DataflowFacts.find(const_cast<Value *>(V));
+    if (It == DataflowFacts.end())
+      return false;
+    if (!It->second.isConstant())
+      return false;
+    Out = It->second.value();
+    return true;
+  };
+
+  auto getReachableBlocks = [&]() {
+    SmallPtrSet<BasicBlock *, 32> Reachable;
+    std::vector<BasicBlock *> Worklist;
+    BasicBlock *Entry = &F.getEntryBlock();
+    Reachable.insert(Entry);
+    Worklist.push_back(Entry);
+
+    while (!Worklist.empty()) {
+      BasicBlock *BB = Worklist.back();
+      Worklist.pop_back();
+
+      Instruction *TI = BB->getTerminator();
+      if (!TI)
+        continue;
+
+      if (auto *BI = dyn_cast<BranchInst>(TI)) {
+        if (BI->isConditional()) {
+          int64_t CondV = 0;
+          if (tryGetConstantInt(BI->getCondition(), CondV)) {
+            BasicBlock *Succ = BI->getSuccessor(CondV != 0 ? 0 : 1);
+            if (Reachable.insert(Succ).second)
+              Worklist.push_back(Succ);
+          } else {
+            for (unsigned i = 0; i < BI->getNumSuccessors(); ++i) {
+              BasicBlock *Succ = BI->getSuccessor(i);
+              if (Reachable.insert(Succ).second)
+                Worklist.push_back(Succ);
+            }
+          }
+        } else {
+          BasicBlock *Succ = BI->getSuccessor(0);
+          if (Reachable.insert(Succ).second)
+            Worklist.push_back(Succ);
+        }
+      } else if (auto *SI = dyn_cast<SwitchInst>(TI)) {
+        // Conservatively assume all successors are reachable.
+        for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
+          BasicBlock *Succ = SI->getSuccessor(i);
+          if (Reachable.insert(Succ).second)
+            Worklist.push_back(Succ);
+        }
+      } else {
+        // ret/unreachable/indirectbr/etc: no outgoing edges handled here.
+      }
+    }
+    return Reachable;
+  };
+
+  // 1) Replace constant-valued instructions with integer constants.
+  // 2) Simplify conditional branches with constant conditions.
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *BI = dyn_cast<BranchInst>(&I)) {
+        if (!BI->isConditional())
+          continue;
+        int64_t CondV = 0;
+        if (!tryGetConstantInt(BI->getCondition(), CondV))
+          continue;
+
+        BasicBlock *Taken = BI->getSuccessor(CondV != 0 ? 0 : 1);
+        IRB.SetInsertPoint(BI);
+        IRB.CreateBr(Taken);
+        BI->eraseFromParent();
+        madeChange = true;
+        break; // Terminator replaced; move to next block.
+      }
+
+      auto It = DataflowFacts.find(&I);
+      if (It == DataflowFacts.end())
+        continue;
+      const ConstantValue &CV = It->second;
+      if (!CV.isConstant())
+        continue;
+      if (I.getType()->isVoidTy())
+        continue;
+      if (I.use_empty()) {
+        AbondonedInst.push_back(&I);
+        continue;
+      }
+
+      Constant *C = ConstantInt::get(I.getType(), CV.value(), true);
+      I.replaceAllUsesWith(C);
+      AbondonedInst.push_back(&I);
+      madeChange = true;
+    }
+  }
+
+  // Re-compute reachability after CFG simplifications.
+  auto Reachable = getReachableBlocks();
+
+  // 3) Remove incoming values of PHI nodes from unreachable predecessors.
+  for (BasicBlock &BB : F) {
+    if (!Reachable.count(&BB))
+      continue;
+    for (PHINode &PN : BB.phis()) {
+      for (int i = static_cast<int>(PN.getNumIncomingValues()) - 1; i >= 0;
+           --i) {
+        BasicBlock *IncomingBB = PN.getIncomingBlock(i);
+        if (!Reachable.count(IncomingBB)) {
+          PN.removeIncomingValue(i, false);
+          madeChange = true;
+        }
+      }
+    }
+  }
+
+  // Identify unreachable blocks for deletion.
+  for (BasicBlock &BB : F) {
+    if (!Reachable.count(&BB))
+      AbondonedBlock.push_back(&BB);
+  }
+
+  // Delete abandoned instructions (in reverse order to keep uses consistent).
+  for (Instruction *I : AbondonedInst) {
+    if (!I || I->isTerminator())
+      continue;
+    if (!I->use_empty())
+      continue;
+    I->eraseFromParent();
+    madeChange = true;
+  }
+
+  // Delete unreachable blocks.
+  for (BasicBlock *BB : AbondonedBlock) {
+    if (!BB)
+      continue;
+    // Ensure no lingering incoming edges in reachable PHIs.
+    for (BasicBlock &RBB : F) {
+      if (!Reachable.count(&RBB))
+        continue;
+      for (PHINode &PN : RBB.phis()) {
+        PN.removeIncomingValue(BB, false);
+      }
+    }
+
+    for (Instruction &I : *BB) {
+      if (!I.getType()->isVoidTy())
+        I.replaceAllUsesWith(UndefValue::get(I.getType()));
+    }
+    BB->dropAllReferences();
+  }
+  for (BasicBlock *BB : AbondonedBlock) {
+    if (!BB)
+      continue;
+    BB->eraseFromParent();
+    madeChange = true;
+  }
 
   //****************************** ASSIGNMENT END ******************************
 
